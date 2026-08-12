@@ -61,13 +61,16 @@ class TrialTracker(Base):
 
 Base.metadata.create_all(bind=engine)
 
-# ------------------- نماذج Pydantic -------------------
+# ------------------- نماذج Pydantic (مع تعيين صريح للأنواع) -------------------
 class KeyGenerateRequest(BaseModel):
     app_id: str = Field(..., example="my_app_v2")
     days_valid: int = Field(DEFAULT_DAYS, ge=1, example=30)
     max_activations: int = Field(1, ge=1, example=5)
     machine_id: Optional[str] = None
     metadata: Optional[Dict[str, Any]] = {}
+
+    class Config:
+        arbitrary_types_allowed = True  # لتجنب أي استدلال خاطئ
 
 class KeyGenerateResponse(BaseModel):
     license_key: str
@@ -106,7 +109,7 @@ class TrialRequest(BaseModel):
     app_id: str
     identifier: str
 
-# ------------------- دوال مساعدة -------------------
+# ------------------- دوال مساعدة (بدون تغيير) -------------------
 def base62_encode(data: bytes) -> str:
     alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
     num = int.from_bytes(data, byteorder='big')
@@ -207,7 +210,7 @@ async def lifespan(app: FastAPI):
     yield
     scheduler.shutdown()
 
-app = FastAPI(title="نظام إدارة مفاتيح التفعيل API", version="2.1", lifespan=lifespan)
+app = FastAPI(title="نظام إدارة مفاتيح التفعيل API", version="2.2", lifespan=lifespan)
 
 # ------------------- نقاط النهاية -------------------
 @app.post("/api/v1/keys/generate", response_model=KeyGenerateResponse)
@@ -392,7 +395,7 @@ async def get_logs(limit: int = 100, db: Session = Depends(get_db)):
 
 @app.get("/health")
 async def health_check():
-    return {"status": "running", "version": "2.1"}
+    return {"status": "running", "version": "2.2"}
 
 # ------------------- التشغيل -------------------
 if __name__ == "__main__":
