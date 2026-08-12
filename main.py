@@ -15,14 +15,12 @@ from sqlalchemy.orm import sessionmaker, Session
 from dotenv import load_dotenv
 from apscheduler.schedulers.background import BackgroundScheduler
 
-# ------------------- التحميل والإعدادات -------------------
 load_dotenv()
 SECRET_KEY = os.getenv("SECRET_KEY", "default_secret_key_change_me")
 DEFAULT_DAYS = int(os.getenv("DEFAULT_DAYS", 30))
 MAX_TRIAL_PER_IP = int(os.getenv("MAX_TRIAL_PER_IP", 3))
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./licenses.db")
 
-# ------------------- قاعدة البيانات -------------------
 Base = declarative_base()
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -61,7 +59,6 @@ class TrialTracker(Base):
 
 Base.metadata.create_all(bind=engine)
 
-# ------------------- نماذج Pydantic (v1) -------------------
 class KeyGenerateRequest(BaseModel):
     app_id: str = Field(..., example="my_app_v2")
     days_valid: int = Field(DEFAULT_DAYS, ge=1, example=30)
@@ -109,7 +106,6 @@ class TrialRequest(BaseModel):
     app_id: str
     identifier: str
 
-# ------------------- دوال مساعدة -------------------
 def base62_encode(data: bytes) -> str:
     alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
     num = int.from_bytes(data, byteorder='big')
@@ -180,7 +176,6 @@ def get_db():
     finally:
         db.close()
 
-# ------------------- جدولة التنظيف التلقائي -------------------
 scheduler = BackgroundScheduler()
 @scheduler.scheduled_job('cron', hour=3, minute=0)
 def clean_expired_keys():
@@ -203,7 +198,6 @@ def clean_expired_keys():
         db.close()
 scheduler.start()
 
-# ------------------- تطبيق FastAPI -------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     scheduler.start()
@@ -212,7 +206,6 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="نظام إدارة مفاتيح التفعيل API", version="2.2", lifespan=lifespan)
 
-# ------------------- نقاط النهاية -------------------
 @app.post("/api/v1/keys/generate", response_model=KeyGenerateResponse)
 async def generate_key(req: KeyGenerateRequest, db: Session = Depends(get_db)):
     key_str, expires = generate_license_key(req.app_id, req.days_valid, req.max_activations)
@@ -397,7 +390,6 @@ async def get_logs(limit: int = 100, db: Session = Depends(get_db)):
 async def health_check():
     return {"status": "running", "version": "2.2"}
 
-# ------------------- التشغيل -------------------
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
