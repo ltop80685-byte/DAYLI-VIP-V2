@@ -61,7 +61,7 @@ class TrialTracker(Base):
 
 Base.metadata.create_all(bind=engine)
 
-# ------------------- نماذج Pydantic (مع تعيين صريح للأنواع) -------------------
+# ------------------- نماذج Pydantic (v1) -------------------
 class KeyGenerateRequest(BaseModel):
     app_id: str = Field(..., example="my_app_v2")
     days_valid: int = Field(DEFAULT_DAYS, ge=1, example=30)
@@ -70,7 +70,7 @@ class KeyGenerateRequest(BaseModel):
     metadata: Optional[Dict[str, Any]] = {}
 
     class Config:
-        arbitrary_types_allowed = True  # لتجنب أي استدلال خاطئ
+        arbitrary_types_allowed = True
 
 class KeyGenerateResponse(BaseModel):
     license_key: str
@@ -109,7 +109,7 @@ class TrialRequest(BaseModel):
     app_id: str
     identifier: str
 
-# ------------------- دوال مساعدة (بدون تغيير) -------------------
+# ------------------- دوال مساعدة -------------------
 def base62_encode(data: bytes) -> str:
     alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
     num = int.from_bytes(data, byteorder='big')
