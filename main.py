@@ -3,20 +3,17 @@ import os
 import secrets
 import hmac
 import hashlib
-import base64
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Depends, Request, BackgroundTasks
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException, Depends, Request
 from pydantic import BaseModel, Field
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean, JSON, Index, func
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean, JSON
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 from dotenv import load_dotenv
 from apscheduler.schedulers.background import BackgroundScheduler
-from passlib.context import CryptContext
 
 # ------------------- التحميل والإعدادات -------------------
 load_dotenv()
@@ -42,8 +39,8 @@ class LicenseKey(Base):
     is_active = Column(Boolean, default=True)
     is_trial = Column(Boolean, default=False)
     metadata = Column(JSON, default={})
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
 
 class LicenseLog(Base):
     __tablename__ = "license_logs"
@@ -53,14 +50,14 @@ class LicenseLog(Base):
     ip_address = Column(String(45))
     user_agent = Column(String(256))
     details = Column(JSON, default={})
-    timestamp = Column(DateTime, default=datetime.utcnow)
+    timestamp = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 class TrialTracker(Base):
     __tablename__ = "trial_tracker"
     id = Column(Integer, primary_key=True, index=True)
-    identifier = Column(String(128), unique=True, index=True)  # IP or email
+    identifier = Column(String(128), unique=True, index=True)
     count = Column(Integer, default=1)
-    first_trial_at = Column(DateTime, default=datetime.utcnow)
+    first_trial_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 Base.metadata.create_all(bind=engine)
 
@@ -81,7 +78,7 @@ class KeyGenerateResponse(BaseModel):
 class KeyVerifyRequest(BaseModel):
     license_key: str
     machine_id: Optional[str] = None
-    app_id: Optional[str] = None  # اختياري للتحقق من التطبيق
+    app_id: Optional[str] = None
 
 class KeyVerifyResponse(BaseModel):
     valid: bool
@@ -107,11 +104,10 @@ class KeyBlockRequest(BaseModel):
 
 class TrialRequest(BaseModel):
     app_id: str
-    identifier: str  # عنوان IP أو بريد إلكتروني لتقييد التجارب
+    identifier: str
 
 # ------------------- دوال مساعدة -------------------
 def base62_encode(data: bytes) -> str:
-    """ترميز Base62 (0-9A-Za-z) لتجنب الأحرف الغامضة"""
     alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
     num = int.from_bytes(data, byteorder='big')
     if num == 0:
@@ -123,28 +119,27 @@ def base62_encode(data: bytes) -> str:
     return ''.join(reversed(result))
 
 def decode_base62(s: str) -> bytes:
-    """فك Base62 إلى بايتات"""
     alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
     num = 0
     for ch in s:
         num = num * 62 + alphabet.index(ch)
-    return num.to_bytes((num.bit_length() + 7) // 8, byteorder='big')
+    length = (num.bit_length() + 7) // 8
+    if length == 0:
+        return b'\x00'
+    return num.to_bytes(length, byteorder='big')
 
 def generate_license_key(app_id: str, days_valid: int, max_activations: int, is_trial: bool = False) -> tuple[str, datetime]:
-    """توليد مفتاح جديد مع توقيع HMAC، وإرجاع المفتاح النصي وتاريخ الانتهاء"""
     salt = secrets.token_bytes(8)
-    expiry = datetime.utcnow() + timedelta(days=days_valid)
+    expiry = datetime.now(timezone.utc) + timedelta(days=days_valid)
     expiry_ts = int(expiry.timestamp())
     payload = f"{app_id}:{expiry_ts}:{max_activations}:{salt.hex()}:{int(is_trial)}"
-    signature = hmac.new(SECRET_KEY.encode(), payload.encode(), hashlib.sha256).digest()[:16]  # 16 بايت
-    # الإصدار 2 (بايت) + طول payload (بايت) + payload + التوقيع
+    signature = hmac.new(SECRET_KEY.encode(), payload.encode(), hashlib.sha256).digest()[:16]
     payload_bytes = payload.encode('utf-8')
     raw = bytes([2]) + bytes([len(payload_bytes)]) + payload_bytes + signature
     key_str = base62_encode(raw)
     return key_str, expiry
 
 def parse_license_key(key_str: str) -> Optional[dict]:
-    """فك المفتاح والتحقق من التوقيع، إرجاع البيانات أو None"""
     try:
         raw = decode_base62(key_str)
         if len(raw) < 3:
@@ -158,7 +153,6 @@ def parse_license_key(key_str: str) -> Optional[dict]:
         payload_bytes = raw[2:2+payload_len]
         signature = raw[2+payload_len:2+payload_len+16]
         payload = payload_bytes.decode('utf-8')
-        # التحقق من التوقيع
         expected = hmac.new(SECRET_KEY.encode(), payload.encode(), hashlib.sha256).digest()[:16]
         if not hmac.compare_digest(signature, expected):
             return None
@@ -185,12 +179,12 @@ def get_db():
 
 # ------------------- جدولة التنظيف التلقائي -------------------
 scheduler = BackgroundScheduler()
-@scheduler.scheduled_job('cron', hour=3, minute=0)  # يومياً عند الساعة 3 صباحاً
+@scheduler.scheduled_job('cron', hour=3, minute=0)
 def clean_expired_keys():
     db = SessionLocal()
     try:
         expired = db.query(LicenseKey).filter(
-            LicenseKey.expires_at < datetime.utcnow(),
+            LicenseKey.expires_at < datetime.now(timezone.utc),
             LicenseKey.is_active == True
         ).all()
         for key in expired:
@@ -209,20 +203,16 @@ scheduler.start()
 # ------------------- تطبيق FastAPI -------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # بدء الجدولة
     scheduler.start()
     yield
     scheduler.shutdown()
 
-app = FastAPI(title="نظام إدارة مفاتيح التفعيل API", version="2.0", lifespan=lifespan)
+app = FastAPI(title="نظام إدارة مفاتيح التفعيل API", version="2.1", lifespan=lifespan)
 
-# ------------------- نقاط النهاية (Endpoints) -------------------
-
-@app.post("/api/v1/keys/generate", response_model=KeyGenerateResponse, summary="توليد مفتاح جديد")
+# ------------------- نقاط النهاية -------------------
+@app.post("/api/v1/keys/generate", response_model=KeyGenerateResponse)
 async def generate_key(req: KeyGenerateRequest, db: Session = Depends(get_db)):
-    """إنشاء مفتاح تفعيل جديد مع صلاحية زمنية وعدد استخدامات"""
     key_str, expires = generate_license_key(req.app_id, req.days_valid, req.max_activations)
-    # حفظ في قاعدة البيانات
     new_key = LicenseKey(
         key_value=key_str,
         app_id=req.app_id,
@@ -241,17 +231,13 @@ async def generate_key(req: KeyGenerateRequest, db: Session = Depends(get_db)):
         max_activations=req.max_activations
     )
 
-@app.post("/api/v1/keys/verify", response_model=KeyVerifyResponse, summary="فحص صلاحية المفتاح")
+@app.post("/api/v1/keys/verify", response_model=KeyVerifyResponse)
 async def verify_key(req: KeyVerifyRequest, request: Request, db: Session = Depends(get_db)):
-    """التحقق من صحة المفتاح، صلاحيته، عد الاستخدامات، وربط الجهاز"""
-    # فك المفتاح
     parsed = parse_license_key(req.license_key)
     if not parsed:
         return KeyVerifyResponse(valid=False, reason="تنسيق المفتاح غير صحيح أو توقيع فاسد")
-    # التحقق من الانتهاء
-    if datetime.utcnow().timestamp() > parsed["expiry_ts"]:
+    if datetime.now(timezone.utc).timestamp() > parsed["expiry_ts"]:
         return KeyVerifyResponse(valid=False, reason="انتهت صلاحية المفتاح")
-    # البحث في قاعدة البيانات
     db_key = db.query(LicenseKey).filter(LicenseKey.key_value == req.license_key).first()
     if not db_key:
         return KeyVerifyResponse(valid=False, reason="المفتاح غير مسجل في النظام")
@@ -263,10 +249,8 @@ async def verify_key(req: KeyVerifyRequest, request: Request, db: Session = Depe
         return KeyVerifyResponse(valid=False, reason="المفتاح مقيد بجهاز آخر")
     if req.app_id and db_key.app_id != req.app_id:
         return KeyVerifyResponse(valid=False, reason="المفتاح غير مخصص لهذا التطبيق")
-    # تحديث عداد الاستخدام
     db_key.used_count += 1
     db.add(db_key)
-    # تسجيل الفحص
     log = LicenseLog(
         key_id=db_key.id,
         action='check',
@@ -276,7 +260,7 @@ async def verify_key(req: KeyVerifyRequest, request: Request, db: Session = Depe
     )
     db.add(log)
     db.commit()
-    remaining_days = (db_key.expires_at - datetime.utcnow()).days
+    remaining_days = (db_key.expires_at - datetime.now(timezone.utc)).days
     return KeyVerifyResponse(
         valid=True,
         app_id=db_key.app_id,
@@ -286,36 +270,31 @@ async def verify_key(req: KeyVerifyRequest, request: Request, db: Session = Depe
         is_trial=db_key.is_trial
     )
 
-@app.post("/api/v1/keys/format", summary="إعادة تنسيق المفتاح")
+@app.post("/api/v1/keys/format")
 async def format_key(req: KeyFormatRequest):
-    """تغيير هيئة المفتاح (إضافة شرطات، تحويل حالة الأحرف) دون تغيير صلاحيته"""
     key = req.license_key
     if req.format_type == "uppercase":
         return {"formatted_key": key.upper()}
     elif req.format_type == "lowercase":
         return {"formatted_key": key.lower()}
     elif req.format_type == "dashed":
-        # إضافة شرطة كل 4 أحرف
         parts = [key[i:i+4] for i in range(0, len(key), 4)]
         return {"formatted_key": "-".join(parts)}
-    else:  # raw
+    else:
         return {"formatted_key": key}
 
-@app.post("/api/v1/keys/extend", summary="تمديد صلاحية المفتاح (ريستارت)")
+@app.post("/api/v1/keys/extend")
 async def extend_key(req: KeyExtendRequest, request: Request, db: Session = Depends(get_db)):
-    """إضافة أيام إضافية للمفتاح، مع إمكانية إعادة تعيين عداد الاستخدام"""
     db_key = db.query(LicenseKey).filter(LicenseKey.key_value == req.license_key).first()
     if not db_key:
         raise HTTPException(status_code=404, detail="المفتاح غير موجود")
     if not db_key.is_active:
         raise HTTPException(status_code=400, detail="المفتاح محظور ولا يمكن تمديده")
-    # تمديد الصلاحية
     new_expiry = db_key.expires_at + timedelta(days=req.extra_days)
     db_key.expires_at = new_expiry
     if req.reset_usage:
         db_key.used_count = 0
     db.add(db_key)
-    # تسجيل العملية
     log = LicenseLog(
         key_id=db_key.id,
         action='extend',
@@ -327,12 +306,11 @@ async def extend_key(req: KeyExtendRequest, request: Request, db: Session = Depe
     return {
         "success": True,
         "new_expires_at": new_expiry.isoformat(),
-        "remaining_days": (new_expiry - datetime.utcnow()).days
+        "remaining_days": (new_expiry - datetime.now(timezone.utc)).days
     }
 
-@app.post("/api/v1/keys/block", summary="حظر مفتاح (إداري)")
+@app.post("/api/v1/keys/block")
 async def block_key(req: KeyBlockRequest, request: Request, db: Session = Depends(get_db)):
-    """تعطيل المفتاح نهائياً"""
     db_key = db.query(LicenseKey).filter(LicenseKey.key_value == req.license_key).first()
     if not db_key:
         raise HTTPException(status_code=404, detail="المفتاح غير موجود")
@@ -350,16 +328,12 @@ async def block_key(req: KeyBlockRequest, request: Request, db: Session = Depend
     db.commit()
     return {"success": True, "message": "تم حظر المفتاح بنجاح"}
 
-@app.post("/api/v1/trial/generate", summary="توليد مفتاح تجريبي (محدود بعدد المحاولات لكل معرف)")
+@app.post("/api/v1/trial/generate")
 async def generate_trial(req: TrialRequest, request: Request, db: Session = Depends(get_db)):
-    """إنشاء مفتاح تجريبي صالح لمدة 7 أيام، مع تحديد عدد المحاولات حسب المعرف"""
-    # التحقق من عدد المحاولات السابقة
     tracker = db.query(TrialTracker).filter(TrialTracker.identifier == req.identifier).first()
     if tracker and tracker.count >= MAX_TRIAL_PER_IP:
         raise HTTPException(status_code=429, detail=f"تجاوزت الحد الأقصى للمحاولات التجريبية ({MAX_TRIAL_PER_IP})")
-    # توليد مفتاح تجريبي (7 أيام، تفعيل واحد)
     key_str, expires = generate_license_key(req.app_id, days_valid=7, max_activations=1, is_trial=True)
-    # حفظ في قاعدة البيانات
     new_key = LicenseKey(
         key_value=key_str,
         app_id=req.app_id,
@@ -369,7 +343,6 @@ async def generate_trial(req: TrialRequest, request: Request, db: Session = Depe
         metadata={'trial_identifier': req.identifier}
     )
     db.add(new_key)
-    # تحديث عداد المحاولات
     if tracker:
         tracker.count += 1
     else:
@@ -383,9 +356,8 @@ async def generate_trial(req: TrialRequest, request: Request, db: Session = Depe
         "remaining_trials": MAX_TRIAL_PER_IP - (tracker.count if tracker else 1)
     }
 
-@app.get("/api/v1/keys/list", summary="عرض جميع المفاتيح (مع إمكانية التصفية)")
+@app.get("/api/v1/keys/list")
 async def list_keys(app_id: Optional[str] = None, active_only: bool = True, db: Session = Depends(get_db)):
-    """قائمة المفاتيح مع بياناتها الأساسية"""
     query = db.query(LicenseKey)
     if app_id:
         query = query.filter(LicenseKey.app_id == app_id)
@@ -395,7 +367,7 @@ async def list_keys(app_id: Optional[str] = None, active_only: bool = True, db: 
     result = []
     for k in keys:
         result.append({
-            "key": k.key_value[:12] + "..." if len(k.key_value) > 12 else k.key_value,  # إخفاء جزئي
+            "key": k.key_value[:12] + "..." if len(k.key_value) > 12 else k.key_value,
             "app_id": k.app_id,
             "expires_at": k.expires_at.isoformat(),
             "used": f"{k.used_count}/{k.max_activations}",
@@ -405,7 +377,7 @@ async def list_keys(app_id: Optional[str] = None, active_only: bool = True, db: 
         })
     return {"count": len(result), "keys": result}
 
-@app.get("/api/v1/logs", summary="سجل العمليات (آخر 100 سجل)")
+@app.get("/api/v1/logs")
 async def get_logs(limit: int = 100, db: Session = Depends(get_db)):
     logs = db.query(LicenseLog).order_by(LicenseLog.timestamp.desc()).limit(limit).all()
     return [
@@ -418,12 +390,11 @@ async def get_logs(limit: int = 100, db: Session = Depends(get_db)):
         for log in logs
     ]
 
-# ------------------- نقطة صحية -------------------
 @app.get("/health")
 async def health_check():
-    return {"status": "running", "version": "2.0"}
+    return {"status": "running", "version": "2.1"}
 
-# ------------------- تشغيل الخادم -------------------
+# ------------------- التشغيل -------------------
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
